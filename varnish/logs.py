@@ -329,6 +329,7 @@ class ClientRequestLog(RequestLog):
         return "miss" in self.vcl_calls
 
     def __repr__(self):
+        indented_bereq="    ".join(repr(self.backend_request).splitlines(True))
         res = """
 <{self.__class__.__name__} XID: {self.id}
     Client: {self.client_ip}:{self.client_port}
@@ -343,12 +344,14 @@ class ClientRequestLog(RequestLog):
     Request: {self.rxprotocol} {self.method} {self.url}
         headers   : {self.rxheaders}
 
+    Backend Request: {bereq}
+
     Hash: {self.hash_data}
     VCL Calls: {self.vcl_calls}
 
     Response: {self.txprotocol} {self.status} {self.response} [{self.length}B]
         headers   : {self.txheaders}
->""".format(self=self)
+>""".format(self=self, bereq=indented_bereq)
         return res
 
     def __str__(self):
