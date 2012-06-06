@@ -94,7 +94,7 @@ class VarnishLogs(object):
 
         logs.dispatch(self.vd, wrapper)
 
-    def dispatch_requests(self, callback, aggregate=1000, source=None,
+    def dispatch_requests(self, callback, aggregate=True, source=None,
                           nonrequest_callback=None):
         """ Read logs from Varnish shared memory Logs, then call callback
             when a RequestLog is complete (all its chunks have been read).
@@ -108,40 +108,29 @@ class VarnishLogs(object):
             varnish.api.logs.LogChunk) which will be invoked for log lines not
             related to any individual request.
         """
-        if aggregate:
-            # use a multidict because it is ordered
-            backend_requests = MultiDict()
-
         def cb(chunk):
-            if chunk.fd == 0 and nonrequest_callback:
-                return nonrequest_callback(chunk)
+            res = False
+            try:
+                if chunk.fd == 0 and nonrequest_callback:
+                    return nonrequest_callback(chunk)
 
-            ev = RequestLog(chunk)
-            # discard invalid, incomplete and empty logs
-            res = True
-            if not ev or not ev.complete or (ev.backend and not ev.chunks):
+                ev = RequestLog(chunk)
+                # discard invalid, incomplete and empty logs
+                res = True
+                if not ev or not ev.complete or (ev.backend and not ev.chunks):
+                    return res
+                
+                # If aggregate, only return client requests with references to backend requests,
+                # otherwise return client and backend requests alike.
+                if ev.complete and ((aggregate and ev.client) or (not aggregate)):
+                    res = callback(ev)
+
+            except:
+                from traceback import print_exc
+                print_exc()
+                pass # Keep on going.
+            finally:
                 return res
-
-            if not aggregate:
-                res = callback(ev)
-
-            elif ev.backend:
-                id_ = ev.txheaders.getone('x-varnish')
-                log.debug("Adding %s to backend_requests", ev)
-                backend_requests.overwrite(id_, ev)
-
-            elif ev.client and ev.id in backend_requests:
-                ev.backend_request = backend_requests.getone(ev.id)
-                res = callback(ev)
-
-            else:
-                # backend request was not read, leaving to None
-                res = callback(ev)
-
-            if aggregate and len(backend_requests) > aggregate:
-                backend_requests.trim(aggregate)
-
-            return res
 
         self.dispatch_chunks(callback=cb, source=source)
 
@@ -164,6 +153,14 @@ class RequestLog(object):
     def __new__(cls, chunk, active=False):
         if chunk.fd in cls._lines:
             obj = cls._lines[chunk.fd]
+            if chunk.client:
+                assert isinstance(obj, ClientRequestLog), \
+                        "Found %s when processing client request log chunk %s" % \
+                            (repr(obj), repr(chunk))
+            elif chunk.backend:
+                assert isinstance(obj, BackendRequestLog), \
+                        "Found %s when processing backend request log chunk %s" % \
+                            (repr(obj), repr(chunk))
 
         else:
             if chunk.client:
@@ -175,17 +172,17 @@ class RequestLog(object):
             else:
                 return None
 
-            obj.init(chunk, active)
+            obj.init(chunk.fd, active)
             cls._lines[chunk.fd] = obj
 
         obj.add_chunk(chunk)
         return obj
 
-    def init(self, chunk, active=False):
+    def init(self, fd, active=False):
         if hasattr(self, "fd"):
             return
 
-        self.fd = chunk.fd
+        self.fd = fd
         self.chunks = []
         self.active = active
         self.complete = False
@@ -216,16 +213,8 @@ class RequestLog(object):
                                chunk.tag.name == 'backendreuse')):
             self.complete = True
             self.active = False
-            del self.__class__._lines[self.fd]
-            if chunk.tag.name == 'backendreuse':
-                # backend reuse need a special case to get the next backend
-                # request as no backendopen will arrive
-                # then we create a new empry object that we now is active
-                next_backend = super(RequestLog, self.__class__)\
-                                        .__new__(BackendRequestLog)
-                next_backend.init(chunk, active=True)
-                self.__class__._lines[chunk.fd] = next_backend
-                next_backend.on_append_chunk(chunk)
+            if chunk.client:
+                del self.__class__._lines[self.fd]
 
         self.on_append_chunk(chunk)
         return self.complete
@@ -263,8 +252,8 @@ class RequestLog(object):
 class ClientRequestLog(RequestLog):
     """ Aggragates chunks for a client request """
 
-    def init(self, chunk, active=False):
-        super(ClientRequestLog, self).init(chunk, active)
+    def init(self, fd, active=False):
+        super(ClientRequestLog, self).init(fd, active)
         self.id = None
         self.vcl_calls = MultiDict()
         self.hash_data = []
@@ -309,6 +298,27 @@ class ClientRequestLog(RequestLog):
 
         elif name == 'txresponse':
             self.response = chunk.data
+
+        elif name == 'backend':
+            backend_fd, director, backend = chunk.data.split(" ")
+            backend_fd = int(backend_fd)
+            
+            known_fds = super(ClientRequestLog, self.__class__)._lines
+            
+            if backend_fd in known_fds:
+                self.backend_request = known_fds[backend_fd]
+                assert isinstance(self.backend_request, BackendRequestLog), \
+                        "Processing chunk %s: fd %s in request table should have been a BackendRequestLog object, was %s" % (repr(chunk), backend_fd, repr(self.backend_request))
+            else:
+                self.backend_request = super(RequestLog, self.__class__)\
+                                            .__new__(BackendRequestLog)
+                self.backend_request.init(backend_fd)
+                self.backend_request.backend_name = backend
+                known_fds[backend_fd] = self.backend_request
+
+            # Directors are not named in the backend log lines themselves, so we propagate it from here.
+            if not self.backend_request.director_name:
+                self.backend_request.director_name = director
 
         elif name == 'reqend':
             xid, started_at, completed_at, \
@@ -359,13 +369,15 @@ class ClientRequestLog(RequestLog):
 
 
 class BackendRequestLog(RequestLog):
-    """ Aggragates chunks for a backend request """
+    """ Aggregates chunks for a backend request """
 
-    def init(self, chunk, active=False):
-        super(BackendRequestLog, self).init(chunk, active)
+    def init(self, fd, active=False):
+        super(BackendRequestLog, self).init(fd, active)
         self.backend_name = None
+        self.director_name = None
 
     def on_append_chunk(self, chunk):
+        log.debug("BackendRequestLog: appending %s to %s" % (chunk, repr(self)))
         super(BackendRequestLog, self).on_append_chunk(chunk)
         name = chunk.tag.name
         if name == 'txrequest':
