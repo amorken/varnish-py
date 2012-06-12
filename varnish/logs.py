@@ -108,14 +108,26 @@ class VarnishLogs(object):
             varnish.api.logs.LogChunk) which will be invoked for log lines not
             related to any individual request.
         """
+        # These log tags are not associated with any particular request.
+        from varnish.api.logs import name_to_tag
+        _ignored_tags = set([name_to_tag(tag) for tag in
+                                ["sessionopen", "sessionclose", "statsess"]])
         def cb(chunk):
             res = False
             try:
-                if chunk.fd == 0 and nonrequest_callback:
-                    return nonrequest_callback(chunk)
+                if chunk.fd == 0:
+                    if nonrequest_callback:
+                        return nonrequest_callback(chunk)
+                    else:
+                        return True
+
+                # Discard log chunks associated with a client session
+                # but not a particular request.
+                if chunk.tag in _ignored_tags:
+                    return True
 
                 ev = RequestLog(chunk)
-                # discard invalid, incomplete and empty logs
+                # discard invalid, incomplete and empty requests
                 res = True
                 if not ev or not ev.complete or (ev.backend and not ev.chunks):
                     return res
@@ -129,8 +141,7 @@ class VarnishLogs(object):
                 from traceback import print_exc
                 print_exc()
                 pass # Keep on going.
-            finally:
-                return res
+            return res
 
         self.dispatch_chunks(callback=cb, source=source)
 
